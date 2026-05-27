@@ -1,0 +1,24 @@
+# Pre-commit hooks for the closed-enumeration state machine library.
+#
+# One-time setup per clone:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually on all files:
+#   pre-commit run --all-files
+
+repos:
+  - repo: local
+    hooks:
+      - id: statemachine-checker
+        name: closed-enumeration checker (statemachine)
+        description: >-
+          Rejects `transition(inst, "STRING", ...)` calls; see checker.py and
+          SPEC §5.3. Stdlib-only, so it runs under any Python 3.10+.
+        entry: python3 checker.py
+        language: system
+        types: [python]
+        # tests/fixtures/planted_violation.py is *required* to violate the rule
+        # — excluding the directory keeps the hook honest without lying about
+        # the test corpus.
+        exclude: ^tests/fixtures/

@@ -45,20 +45,22 @@ extended at runtime. Closure is enforced at four layers:
    for the lifetime of every instance bound to that machine.
 
 2. **Structural (Pydantic).** `StateMachine` is declared with
-   `model_config = ConfigDict(frozen=True, extra="forbid")` and
-   `MachineInstance` with `extra="forbid"`. Any attempt to assign a new
-   attribute (`instance.new_attr = "..."`) raises `ClosedEnumerationError`
-   via the overridden `__setattr__`.
+   `model_config = ConfigDict(frozen=True, extra="forbid")`, so any mutation
+   of a definition surfaces as a pydantic frozen-model error. `MachineInstance`
+   is declared with `extra="forbid"` and overrides `__setattr__` to translate
+   pydantic's rejection of unknown attributes into `ClosedEnumerationError`,
+   so `instance.new_attr = "..."` raises with a domain-specific message.
 
 3. **Runtime (`transition`).** Every call validates the `to` argument against
    the bound Enum *before* the transition table is consulted. A raw string, an
    `int`, or a member of a different Enum is rejected. The library never
    coerces string-to-Enum.
 
-4. **Static (`checker.py`).** An AST-based linter catches `transition()` calls
-   that use a string literal as the second positional argument *before* the
-   code is ever executed. Wire it into pre-commit so violations never reach
-   `main`. See "Static analyzer" below.
+4. **Static (`checker.py`).** An AST-based linter catches both
+   `define_machine(states=...)` calls whose `states` is a literal collection
+   (Rule A) and `transition()` calls whose second positional argument is a
+   string literal (Rule B), *before* the code is ever executed. Wire it into
+   pre-commit so violations never reach `main`. See "Static analyzer" below.
 
 The first three layers each emit a permanent audit record (`SUCCESS`,
 `BLOCKED_ILLEGAL`, or `BLOCKED_UNDECLARED`) on every `transition()` call,
@@ -151,8 +153,8 @@ Exit codes:
 A line ending with `# noqa: closure` is exempt from the check. This is
 reserved for tests and worked examples that *intentionally* demonstrate the
 runtime guard rejecting a string — see the three call sites in
-`tests/test_statemachine.py` and `example.py`. Production code should never
-use it.
+`tests/test_statemachine.py` and the one in `example.py`. Production code
+should never use it.
 
 A `.pre-commit-config.yaml` ships with the repo that wires the checker into
 the standard pre-commit framework:
@@ -172,6 +174,13 @@ deliberately invalid.
 .venv/bin/python -m pytest
 ```
 
-The suite contains the 20 SPEC-mandated tests plus
-`tests/test_clock_seam.py`, which documents and verifies the clock
-dependency-injection seam used by `example.py` and by downstream SLA tests.
+`tests/test_statemachine.py` contains the 20 SPEC-mandated tests (SPEC §6)
+plus one extension — `test_static_checker_flags_planted_states_violation` —
+which pins Rule A of the static checker. Two further files cover seams that
+sit outside SPEC §6 but are load-bearing for the library:
+
+- `tests/test_clock_seam.py` documents and verifies the clock
+  dependency-injection seam used by `example.py` and by downstream SLA tests.
+- `tests/test_checker_noqa.py` pins the semantics of the `# noqa: closure`
+  escape hatch so a future refactor of `checker.py` cannot silently
+  re-enable violations on lines that deliberately demonstrate the guard.

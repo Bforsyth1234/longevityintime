@@ -1,9 +1,16 @@
-"""Public API stubs for the closed-enumeration state machine library.
+"""Public API for the closed-enumeration state machine library.
 
-Function bodies are intentionally left unimplemented; this module defines
-the type-safe boundaries against which the SDD test suite is written first.
+Runtime state — current node, audit history, and the injected clock — is
+deliberately not stored as attributes on `MachineInstance`. It lives in a
+module-private `WeakKeyDictionary` (`_STATE`) keyed by instance identity,
+so `instance._history` and the like raise `AttributeError` rather than
+exposing mutable internals. Deliberate trespass against `_STATE` is
+detected by `verify_history()` via a per-record hash chain.
 """
 
+import hashlib
+import time
+import weakref
 from collections import deque
 from collections.abc import Callable
 from enum import Enum
@@ -20,6 +27,7 @@ from .models import (
     TransitionDef,
     TransitionRecord,
     TransitionResult,
+    TransitionStatus,
 )
 
 __all__ = [
@@ -37,7 +45,89 @@ __all__ = [
     "define_machine",
     "history",
     "transition",
+    "verify_history",
 ]
+
+
+GENESIS_HASH = "0" * 64
+
+
+class _InstanceState:
+    """Backing store for a single `MachineInstance`.
+
+    Held only in the module-private `_STATE` map; never exposed as an
+    attribute of `MachineInstance`.
+    """
+
+    __slots__ = ("current_state", "history", "clock")
+
+    def __init__(self, current_state: Enum, clock: Callable[[], float]) -> None:
+        self.current_state: Enum = current_state
+        self.history: list[TransitionRecord] = []
+        self.clock: Callable[[], float] = clock
+
+
+_STATE: "weakref.WeakKeyDictionary[MachineInstance, _InstanceState]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _safe_repr(value: Any) -> str:
+    """Canonical string representation used inside the chain hash.
+
+    Enums are serialized as `ClassName.MEMBER` so the hash is stable across
+    Python sessions and does not depend on `id()` or memory layout.
+    """
+    if isinstance(value, Enum):
+        return f"{type(value).__name__}.{value.name}"
+    return repr(value)
+
+
+def _compute_chain_hash(
+    timestamp: float,
+    from_state: Any,
+    to_state: Any,
+    reason: str,
+    status: str,
+    prev_chain_hash: str,
+) -> str:
+    payload = "\x1f".join(
+        [
+            repr(timestamp),
+            _safe_repr(from_state),
+            _safe_repr(to_state),
+            reason,
+            status,
+            prev_chain_hash,
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _append_record(
+    state: _InstanceState,
+    from_state: Any,
+    to_state: Any,
+    reason: str,
+    status: TransitionStatus,
+) -> None:
+    """Build a hash-chained `TransitionRecord` and append it to `state.history`."""
+    prev_hash = state.history[-1].chain_hash if state.history else GENESIS_HASH
+    timestamp = state.clock()
+    chain_hash = _compute_chain_hash(
+        timestamp, from_state, to_state, reason, status, prev_hash
+    )
+    state.history.append(
+        TransitionRecord(
+            timestamp=timestamp,
+            from_state=from_state,
+            to_state=to_state,
+            reason=reason,
+            status=status,
+            prev_chain_hash=prev_hash,
+            chain_hash=chain_hash,
+        )
+    )
 
 
 def define_machine(
@@ -83,16 +173,15 @@ def create_instance(
 ) -> MachineInstance:
     """Instantiate a runtime container bound to `machine`.
 
-    Sets the private `_current_state` to `machine.initial` and initializes
-    the private `_history` to an empty list. The optional `clock` keyword
-    overrides the default `time.time` source used to timestamp transitions —
-    pass a fixed-value lambda from tests to control time deterministically.
+    The instance itself is frozen and stateless; current state, audit
+    history, and the optional `clock` injection are stored in the module-
+    private `_STATE` map. The default clock is `time.time`.
     """
     instance = MachineInstance(machine=machine)
-    instance._current_state = machine.initial
-    instance._history = []
-    if clock is not None:
-        instance._clock = clock
+    _STATE[instance] = _InstanceState(
+        current_state=machine.initial,
+        clock=clock if clock is not None else time.time,
+    )
     return instance
 
 
@@ -110,66 +199,76 @@ def transition(
     - If `(current_state, to)` is not in `machine.allowed_transitions`,
       append a `"BLOCKED_ILLEGAL"` record to history, then raise
       `IllegalTransitionError`.
-    - Otherwise, mutate `_current_state`, append a `"SUCCESS"` record,
+    - Otherwise, advance the current state, append a `"SUCCESS"` record,
       and return a successful `TransitionResult`.
+
+    Every appended record is hash-chained to its predecessor so that
+    `verify_history()` can detect after-the-fact content tampering,
+    insertion, or reordering of records inside `_STATE`.
     """
+    state = _STATE[instance]
     machine = instance.machine
-    current_state = instance._current_state
-    now = instance._clock
+    current_state = state.current_state
 
     if not isinstance(to, machine.states):
-        instance._history.append(
-            TransitionRecord(
-                timestamp=now(),
-                from_state=current_state,
-                to_state=to,
-                reason=reason,
-                status="BLOCKED_UNDECLARED",
-            )
-        )
+        _append_record(state, current_state, to, reason, "BLOCKED_UNDECLARED")
         raise UndeclaredStateError(
             f"{to!r} is not a declared member of {machine.states.__name__}"
         )
 
     if (current_state, to) not in machine.allowed_transitions:
-        instance._history.append(
-            TransitionRecord(
-                timestamp=now(),
-                from_state=current_state,
-                to_state=to,
-                reason=reason,
-                status="BLOCKED_ILLEGAL",
-            )
-        )
+        _append_record(state, current_state, to, reason, "BLOCKED_ILLEGAL")
         raise IllegalTransitionError(
             f"no transition declared from {current_state.name} to {to.name}"
         )
 
-    instance._history.append(
-        TransitionRecord(
-            timestamp=now(),
-            from_state=current_state,
-            to_state=to,
-            reason=reason,
-            status="SUCCESS",
-        )
-    )
-    instance._current_state = to
+    _append_record(state, current_state, to, reason, "SUCCESS")
+    state.current_state = to
     return TransitionResult(success=True, current_state=to)
 
 
 def current(instance: MachineInstance) -> Enum:
     """Return the current state of `instance`."""
-    return instance._current_state
+    return _STATE[instance].current_state
 
 
 def history(instance: MachineInstance) -> tuple[TransitionRecord, ...]:
-    """Return a mathematically decoupled snapshot of the audit history.
+    """Return an immutable snapshot of the audit history.
 
-    External mutation of the returned object must not alter the
-    instance's internal `_history`.
+    The returned tuple is a shallow copy of the live log; the records
+    themselves are frozen pydantic models, so callers cannot rewrite a
+    record's fields. Module-internal tampering against `_STATE` is
+    detected by `verify_history()`, not prevented here.
     """
-    return tuple(instance._history)
+    return tuple(_STATE[instance].history)
+
+
+def verify_history(instance: MachineInstance) -> bool:
+    """Recompute the per-record hash chain and confirm it is intact.
+
+    Returns `True` iff every record's `prev_chain_hash` matches the prior
+    record's `chain_hash` and every record's `chain_hash` matches the
+    SHA-256 of its own content. This detects content mutation, insertion,
+    and reordering of records inside `_STATE`. It cannot detect tail
+    truncation — see the README's "Tamper Resistance" section for the
+    threat model and the documented limit.
+    """
+    prev_hash = GENESIS_HASH
+    for record in _STATE[instance].history:
+        if record.prev_chain_hash != prev_hash:
+            return False
+        expected = _compute_chain_hash(
+            record.timestamp,
+            record.from_state,
+            record.to_state,
+            record.reason,
+            record.status,
+            prev_hash,
+        )
+        if record.chain_hash != expected:
+            return False
+        prev_hash = record.chain_hash
+    return True
 
 
 def check_reachability(machine: StateMachine) -> set[Enum]:

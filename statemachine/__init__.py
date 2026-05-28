@@ -7,6 +7,7 @@ from .core import (
     define_machine,
     history,
     transition,
+    verify_history,
 )
 from .exceptions import (
     ClosedEnumerationError,
@@ -36,4 +37,5 @@ __all__ = [
     "define_machine",
     "history",
     "transition",
+    "verify_history",
 ]

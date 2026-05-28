@@ -47,9 +47,12 @@ extended at runtime. Closure is enforced at four layers:
 2. **Structural (Pydantic).** `StateMachine` is declared with
    `model_config = ConfigDict(frozen=True, extra="forbid")`, so any mutation
    of a definition surfaces as a pydantic frozen-model error. `MachineInstance`
-   is declared with `extra="forbid"` and overrides `__setattr__` to translate
-   pydantic's rejection of unknown attributes into `ClosedEnumerationError`,
-   so `instance.new_attr = "..."` raises with a domain-specific message.
+   is also frozen and carries **no** state attributes — current state, audit
+   history, and the injected clock all live in a module-private
+   `WeakKeyDictionary` (`statemachine.core._STATE`) keyed by instance identity.
+   `MachineInstance.__setattr__` rejects any attribute write (declared field
+   or leading-underscore alike) with `ClosedEnumerationError`. See "Tamper
+   Resistance" below for the threat model.
 
 3. **Runtime (`transition`).** Every call validates the `to` argument against
    the bound Enum *before* the transition table is consulted. A raw string, an
@@ -65,6 +68,49 @@ extended at runtime. Closure is enforced at four layers:
 The first three layers each emit a permanent audit record (`SUCCESS`,
 `BLOCKED_ILLEGAL`, or `BLOCKED_UNDECLARED`) on every `transition()` call,
 including ones that raise — see SPEC §5.2.
+
+## Tamper Resistance
+
+"Closure" and "the history is never mutated" are not a single property.
+The library defends three different threat models, layered from strongest
+to weakest:
+
+1. **Public API closure.** Honest callers cannot reach a primitive that
+   mutates state or rewrites history. `transition()` is the only mutator;
+   `history()` returns a tuple of `frozen=True` `TransitionRecord`s; there
+   is no edit or delete primitive.
+
+2. **Conventional reach-around blocked.** Dereferencing leading-underscore
+   attributes on an instance — the Python "private by convention" idiom —
+   yields `AttributeError`, not mutable state. `MachineInstance` carries
+   no `_current_state`, `_history`, or `_clock` attributes. The backing
+   `_InstanceState` lives in a module-private `WeakKeyDictionary`
+   (`statemachine.core._STATE`) keyed by instance identity. Pydantic v2's
+   default behavior of routing undeclared underscore-prefixed names into
+   `__dict__` is closed off by an explicit allowlist in
+   `MachineInstance.__setattr__`.
+
+3. **Deliberate module-internal trespass detected.** A caller who imports
+   `statemachine.core._STATE` and mutates the audit log directly is **not
+   prevented** — Python ultimately admits this — but is **detected**. Each
+   `TransitionRecord` carries `prev_chain_hash` and `chain_hash`. The hash
+   commits to the record's full content plus the previous record's
+   `chain_hash`, so any content mutation, insertion, or reordering
+   anywhere in the log invalidates the chain from that point forward.
+   `verify_history(instance) -> bool` walks the log and returns `False`
+   on any break.
+
+**What is explicitly *not* defended:** tail truncation of the log from
+inside `_STATE`. A single-process Python library cannot detect "the log
+used to be longer" without an external commitment (a notary, a log
+shipper, a counter sent off-process). The hash chain catches edits to
+records that remain; it does not catch wholesale removal of the tail.
+Downstream callers who need that property should ship records to an
+append-only external store as they're produced.
+
+The three layers are tested in `tests/test_tamper_resistance.py`. The
+test file names each attack vector explicitly so a future reviewer can
+audit which guarantees are pinned and which are documented limits.
 
 ## Transition Table Format
 
@@ -109,6 +155,7 @@ orphan states like a `COMPLETED` with no inbound edges.
 | `transition(instance, to, reason)` | `TransitionResult` | Apply or block a move; always records to history |
 | `current(instance)` | `Enum` | Current state |
 | `history(instance)` | `tuple[TransitionRecord, ...]` | Immutable snapshot of audit history |
+| `verify_history(instance)` | `bool` | `True` iff the audit log's hash chain is intact |
 | `check_reachability(machine)` | `set[Enum]` | States unreachable from `initial` |
 
 The `clock=` keyword on `create_instance` injects a `Callable[[], float]`
@@ -176,11 +223,16 @@ deliberately invalid.
 
 `tests/test_statemachine.py` contains the 20 SPEC-mandated tests (SPEC §6)
 plus one extension — `test_static_checker_flags_planted_states_violation` —
-which pins Rule A of the static checker. Two further files cover seams that
-sit outside SPEC §6 but are load-bearing for the library:
+which pins Rule A of the static checker. Three further files cover seams
+and guarantees that sit outside SPEC §6 but are load-bearing for the
+library:
 
 - `tests/test_clock_seam.py` documents and verifies the clock
   dependency-injection seam used by `example.py` and by downstream SLA tests.
 - `tests/test_checker_noqa.py` pins the semantics of the `# noqa: closure`
   escape hatch so a future refactor of `checker.py` cannot silently
   re-enable violations on lines that deliberately demonstrate the guard.
+- `tests/test_tamper_resistance.py` pins the three-layer contract described
+  in the "Tamper Resistance" section above, with one named test per attack
+  vector (record field write, underscore-attribute reach-around,
+  hash-chain content tamper, record insertion, record reordering).

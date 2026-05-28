@@ -13,6 +13,7 @@ from .exceptions import (
     ClosedEnumerationError,
     IllegalTransitionError,
     UndeclaredStateError,
+    UnknownInstanceError,
 )
 from .models import (
     MachineInstance,
@@ -31,6 +32,7 @@ __all__ = [
     "TransitionRecord",
     "TransitionResult",
     "UndeclaredStateError",
+    "UnknownInstanceError",
     "check_reachability",
     "create_instance",
     "current",

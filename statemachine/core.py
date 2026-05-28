@@ -20,6 +20,7 @@ from .exceptions import (
     ClosedEnumerationError,
     IllegalTransitionError,
     UndeclaredStateError,
+    UnknownInstanceError,
 )
 from .models import (
     MachineInstance,
@@ -34,6 +35,7 @@ __all__ = [
     "ClosedEnumerationError",
     "IllegalTransitionError",
     "UndeclaredStateError",
+    "UnknownInstanceError",
     "MachineInstance",
     "StateMachine",
     "TransitionDef",
@@ -72,14 +74,34 @@ _STATE: "weakref.WeakKeyDictionary[MachineInstance, _InstanceState]" = (
 )
 
 
+def _get_state(instance: MachineInstance) -> _InstanceState:
+    """Look up `instance` in `_STATE`, raising a domain-specific error on miss.
+
+    A `MachineInstance` constructed directly or produced via `model_copy()`
+    is never registered in `_STATE`; surfacing the resulting `KeyError`
+    would leak an internal data structure, so the miss is translated into
+    `UnknownInstanceError`.
+    """
+    try:
+        return _STATE[instance]
+    except KeyError as exc:
+        raise UnknownInstanceError(
+            "MachineInstance was not produced by create_instance(); "
+            "direct construction and model_copy() are unsupported"
+        ) from exc
+
+
 def _safe_repr(value: Any) -> str:
     """Canonical string representation used inside the chain hash.
 
-    Enums are serialized as `ClassName.MEMBER` so the hash is stable across
-    Python sessions and does not depend on `id()` or memory layout.
+    Enums are serialized as `module:QualName.MEMBER` so the hash commitment
+    is unambiguous across distinct Enum types that happen to share a class
+    name and member name, and is stable across Python sessions independent
+    of `id()` or memory layout.
     """
     if isinstance(value, Enum):
-        return f"{type(value).__name__}.{value.name}"
+        cls = type(value)
+        return f"{cls.__module__}:{cls.__qualname__}.{value.name}"
     return repr(value)
 
 
@@ -206,7 +228,7 @@ def transition(
     `verify_history()` can detect after-the-fact content tampering,
     insertion, or reordering of records inside `_STATE`.
     """
-    state = _STATE[instance]
+    state = _get_state(instance)
     machine = instance.machine
     current_state = state.current_state
 
@@ -229,7 +251,7 @@ def transition(
 
 def current(instance: MachineInstance) -> Enum:
     """Return the current state of `instance`."""
-    return _STATE[instance].current_state
+    return _get_state(instance).current_state
 
 
 def history(instance: MachineInstance) -> tuple[TransitionRecord, ...]:
@@ -240,7 +262,7 @@ def history(instance: MachineInstance) -> tuple[TransitionRecord, ...]:
     record's fields. Module-internal tampering against `_STATE` is
     detected by `verify_history()`, not prevented here.
     """
-    return tuple(_STATE[instance].history)
+    return tuple(_get_state(instance).history)
 
 
 def verify_history(instance: MachineInstance) -> bool:
@@ -254,7 +276,7 @@ def verify_history(instance: MachineInstance) -> bool:
     threat model and the documented limit.
     """
     prev_hash = GENESIS_HASH
-    for record in _STATE[instance].history:
+    for record in _get_state(instance).history:
         if record.prev_chain_hash != prev_hash:
             return False
         expected = _compute_chain_hash(

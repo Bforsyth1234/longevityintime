@@ -14,3 +14,10 @@ class UndeclaredStateError(Exception):
 class IllegalTransitionError(Exception):
     """Raised when attempting to transition between two declared states
     where no explicit transition edge was mapped in `allowed_transitions`."""
+
+
+class UnknownInstanceError(Exception):
+    """Raised when a `MachineInstance` not produced by `create_instance`
+    is passed to a runtime function. Direct construction or `model_copy()`
+    of a `MachineInstance` bypasses registration in the module-private
+    state map and is unsupported."""

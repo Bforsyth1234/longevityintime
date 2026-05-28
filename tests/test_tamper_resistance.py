@@ -26,7 +26,10 @@ import pytest
 
 from statemachine import (
     ClosedEnumerationError,
+    MachineInstance,
+    UnknownInstanceError,
     create_instance,
+    current,
     define_machine,
     history,
     transition,
@@ -165,3 +168,41 @@ def test_chain_hash_links_records() -> None:
     log = history(instance)
     assert log[0].prev_chain_hash == "0" * 64
     assert log[1].prev_chain_hash == log[0].chain_hash
+
+
+# ---------------------------------------------------------------------------
+# Unregistered instances raise a domain-specific error, not a raw KeyError
+# ---------------------------------------------------------------------------
+
+
+def test_transition_on_directly_constructed_instance_raises() -> None:
+    """Bypassing `create_instance` does not surface as a raw KeyError."""
+    rogue = MachineInstance(machine=_machine())
+    with pytest.raises(UnknownInstanceError):
+        transition(rogue, _S.B, "submit")
+
+
+def test_current_on_directly_constructed_instance_raises() -> None:
+    rogue = MachineInstance(machine=_machine())
+    with pytest.raises(UnknownInstanceError):
+        current(rogue)
+
+
+def test_history_on_directly_constructed_instance_raises() -> None:
+    rogue = MachineInstance(machine=_machine())
+    with pytest.raises(UnknownInstanceError):
+        history(rogue)
+
+
+def test_verify_history_on_directly_constructed_instance_raises() -> None:
+    rogue = MachineInstance(machine=_machine())
+    with pytest.raises(UnknownInstanceError):
+        verify_history(rogue)
+
+
+def test_model_copy_produces_unregistered_instance() -> None:
+    """`model_copy()` returns a new instance that was never registered."""
+    instance = create_instance(_machine())
+    copy = instance.model_copy()
+    with pytest.raises(UnknownInstanceError):
+        transition(copy, _S.B, "submit")
